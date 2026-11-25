@@ -69,7 +69,7 @@ Requirements: Node 20+, Chrome Desktop v139+ for the on-device path.
 
 - `src/lib/ai.ts` creates two hybrid models with `getGenerativeModel`:
   `draftModel` (`PREFER_ON_DEVICE`) and `polishModel` (`PREFER_IN_CLOUD`), both with
-  `gemini-2.5-flash` as the in-cloud model on the Gemini Developer API backend.
+  `gemini-3.8-flash` as the in-cloud model on the Gemini Developer API backend.
 - Both calls use structured output (`responseSchema` + `application/json`) and read
   `result.response.inferenceSource` to label where inference actually ran.
 - `initializeDeviceModel()` is called from the Draft button's click handler (a user
