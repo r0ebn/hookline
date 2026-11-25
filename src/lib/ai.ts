@@ -247,35 +247,111 @@ export async function draftHooksAndCaptions(
     },
   };
 
-  // Two attempts: device first, then cloud. A generation that returns
-  // unusable text (for example Gemini Nano answering with prose around the
-  // JSON) counts as a failed attempt, so the cloud attempt still runs and
-  // the user is never stuck with a parse error.
+  // Attempt order:
+  // 1. Structured JSON, device preferred. The happy path when Gemini Nano
+  //    follows the schema.
+  // 2. Plain line format, device ONLY. Small on-device models often ignore
+  //    JSON schemas or truncate long JSON; a line format ("HOOK: ..." /
+  //    "CAPTION: ...") is far easier for them, and forcing ONLY_ON_DEVICE
+  //    proves the draft really ran locally.
+  // 3. Structured JSON, cloud preferred. The guaranteed fallback.
   let lastError: unknown;
-  for (const mode of [
-    InferenceMode.PREFER_ON_DEVICE,
-    InferenceMode.PREFER_IN_CLOUD,
-  ]) {
-    try {
-      const result = await generateWithFallback(mode, request);
-      const parsed = parseJson(result.response.text());
-      const hooks = asStringArray(parsed.hooks, "hooks").slice(0, 5);
-      const captions = asStringArray(parsed.captions, "captions").slice(0, 3);
-      if (hooks.length === 0 || captions.length === 0) {
-        throw new Error("The model returned no hooks or captions.");
-      }
-      return {
-        hooks,
-        captions,
-        origin: toOrigin(result.response.inferenceSource),
-      };
-    } catch (error) {
-      lastError = error;
-    }
+
+  try {
+    const result = await generateWithFallback(
+      InferenceMode.PREFER_ON_DEVICE,
+      request,
+    );
+    return parseDraftResult(result);
+  } catch (error) {
+    lastError = error;
   }
+
+  try {
+    return await draftPlainTextOnDevice(transcript);
+  } catch (error) {
+    lastError = error;
+  }
+
+  try {
+    const result = await generateWithFallback(
+      InferenceMode.PREFER_IN_CLOUD,
+      request,
+    );
+    return parseDraftResult(result);
+  } catch (error) {
+    lastError = error;
+  }
+
   throw new Error(
     `Draft failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
   );
+}
+
+type DraftGenerateResult = Awaited<
+  ReturnType<GenerativeModel["generateContent"]>
+>;
+
+function parseDraftResult(result: DraftGenerateResult): DraftResult {
+  const parsed = parseJson(result.response.text());
+  const hooks = asStringArray(parsed.hooks, "hooks").slice(0, 5);
+  const captions = asStringArray(parsed.captions, "captions").slice(0, 3);
+  if (hooks.length === 0 || captions.length === 0) {
+    throw new Error("The model returned no hooks or captions.");
+  }
+  return {
+    hooks,
+    captions,
+    origin: toOrigin(result.response.inferenceSource),
+  };
+}
+
+/**
+ * Drafts on the on-device model only, using a plain line format instead of
+ * JSON. Throws when no on-device model is available or its answer does not
+ * contain enough usable lines, so the caller can fall back to the cloud.
+ */
+async function draftPlainTextOnDevice(
+  transcript: string,
+): Promise<DraftResult> {
+  const prompt = [
+    "You are Hookline, a hook and caption assistant for short-form clip creators (TikTok, Reels, Shorts).",
+    "From the video transcript below, write 5 scroll-stopping hooks and 3 short captions.",
+    "Each hook is one short line (max 12 words) for the first 3 seconds of the video. Vary the angles: one question, one bold claim, one curiosity gap, one relatable pain point, one number or result.",
+    "Each caption is one short line (max 40 words) with a different tone: punchy, friendly, and curiosity-driven.",
+    "Write in the same language as the transcript. No emojis inside hooks. No hashtags.",
+    "Answer in EXACTLY this format, one item per line, nothing else:",
+    "HOOK: <hook text>",
+    "CAPTION: <caption text>",
+    "",
+    "TRANSCRIPT:",
+    transcript.trim(),
+  ].join("\n");
+
+  const result = await hybridModel(
+    InferenceMode.ONLY_ON_DEVICE,
+    CLOUD_MODELS[0],
+  ).generateContent({
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.8 },
+  });
+
+  const hooks: string[] = [];
+  const captions: string[] = [];
+  for (const line of result.response.text().split(/\r?\n/)) {
+    const hookMatch = line.match(/^\s*(?:[-*\d.]+\s*)?HOOK:\s*(.+)$/i);
+    const captionMatch = line.match(/^\s*(?:[-*\d.]+\s*)?CAPTION:\s*(.+)$/i);
+    if (hookMatch) hooks.push(hookMatch[1].trim());
+    else if (captionMatch) captions.push(captionMatch[1].trim());
+  }
+  if (hooks.length < 3 || captions.length < 1) {
+    throw new Error("The on-device model returned too few usable lines.");
+  }
+  return {
+    hooks: hooks.slice(0, 5),
+    captions: captions.slice(0, 3),
+    origin: toOrigin(result.response.inferenceSource),
+  };
 }
 
 /**
