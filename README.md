@@ -67,9 +67,14 @@ Requirements: Node 20+, Chrome Desktop v139+ for the on-device path.
 
 ## How Firebase AI Logic is used
 
-- `src/lib/ai.ts` creates two hybrid models with `getGenerativeModel`:
-  `draftModel` (`PREFER_ON_DEVICE`) and `polishModel` (`PREFER_IN_CLOUD`), both with
-  `gemini-3.8-flash` as the in-cloud model on the Gemini Developer API backend.
+- `src/lib/ai.ts` creates hybrid models with `getGenerativeModel`:
+  the draft step uses `PREFER_ON_DEVICE` and the polish step uses
+  `PREFER_IN_CLOUD`, on the Gemini Developer API backend.
+- Cloud calls walk a fallback chain of Gemini models
+  (`gemini-3.5-flash-lite`, then `gemini-3.1-flash-lite`, `gemini-3.8-flash`,
+  `gemini-3.5-flash`), so if one model is overloaded or retired the next one
+  answers automatically. The heavier `gemini-3.8-flash` proved chronically
+  overloaded on the free tier, which is why the Lite models lead the chain.
 - Both calls use structured output (`responseSchema` + `application/json`) and read
   `result.response.inferenceSource` to label where inference actually ran.
 - `initializeDeviceModel()` is called from the Draft button's click handler (a user
