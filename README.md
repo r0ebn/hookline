@@ -75,6 +75,14 @@ Requirements: Node 20+, Chrome Desktop v139+ for the on-device path.
   `gemini-3.5-flash`), so if one model is overloaded or retired the next one
   answers automatically. The heavier `gemini-3.8-flash` proved chronically
   overloaded on the free tier, which is why the Lite models lead the chain.
+- Drafting tries three attempts in order: structured JSON with
+  `PREFER_ON_DEVICE`; a plain line format with `ONLY_ON_DEVICE` (small
+  on-device models often ignore JSON schemas or truncate long JSON, while a
+  line format is easy for them, and the badge then proves the draft ran
+  locally); and structured JSON with `PREFER_IN_CLOUD`. Verified live on
+  25 Nov 2026: Gemini Nano drafted on-device in Chrome on Windows with the
+  "On-device · Gemini Nano" badge, and the cloud path completed the full
+  flow end to end.
 - Both calls use structured output (`responseSchema` + `application/json`) and read
   `result.response.inferenceSource` to label where inference actually ran.
 - `initializeDeviceModel()` is called from the Draft button's click handler (a user
