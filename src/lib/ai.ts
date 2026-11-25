@@ -2,10 +2,10 @@
 // (the hackathon requirement). No other model API is called anywhere.
 //
 // Hybrid routing:
-// - draftModel  -> InferenceMode.PREFER_ON_DEVICE: Gemini Nano in Chrome
+// - Draft step  -> InferenceMode.PREFER_ON_DEVICE: Gemini Nano in Chrome
 //   drafts locally (fast, private, works offline); if on-device inference is
-//   unavailable the SDK falls back to the cloud model in inCloudParams.
-// - polishModel -> InferenceMode.PREFER_IN_CLOUD: the longer, higher quality
+//   unavailable the SDK falls back to a cloud model from the fallback chain.
+// - Polish step -> InferenceMode.PREFER_IN_CLOUD: the longer, higher quality
 //   rewrite runs on cloud Gemini, with on-device as fallback.
 //
 // Which one actually served a request is read back from
@@ -26,30 +26,63 @@ import { firebaseApp } from "./firebase";
 // Pattern follows https://firebase.google.com/docs/ai-logic/hybrid/web/get-started
 const ai = getAI(firebaseApp, { backend: new GoogleAIBackend() });
 
-// Cloud model used whenever a hybrid request is served in the cloud
-// (free tier on the Gemini Developer API backend, no billing).
-// NOTE: gemini-2.5-flash returns 404 "no longer available to new users" on
-// projects created in Nov 2026; the backend error itself names this model.
-const CLOUD_MODEL = "gemini-3.8-flash";
+// Cloud models, tried in order whenever a hybrid request is served in the
+// cloud (free tier on the Gemini Developer API backend, no billing).
+// Model choice history, learned from live calls on this project:
+// - gemini-2.5-flash: 404, "no longer available to new users" (Nov 2026).
+// - gemini-3.8-flash: reachable but chronically overloaded on the free tier
+//   (503 deadline expired, then 500 "high demand" twice in a row).
+// - The Flash-Lite models carry the bulk of successful free-tier traffic,
+//   so they lead the chain; heavier models remain as later fallbacks.
+// If one model errors (overload, timeout, retirement), the next is tried
+// automatically, so a single busy model never blocks the user.
+const CLOUD_MODELS = [
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+  "gemini-3.8-flash",
+  "gemini-3.5-flash",
+];
+
+function hybridModel(
+  mode: InferenceMode,
+  cloudModel: string,
+): GenerativeModel {
+  return getGenerativeModel(ai, {
+    mode,
+    inCloudParams: { model: cloudModel },
+  });
+}
+
+/** Device-facing model, used to prepare (download) Gemini Nano. */
+const deviceModel: GenerativeModel = hybridModel(
+  InferenceMode.PREFER_ON_DEVICE,
+  CLOUD_MODELS[0],
+);
+
+type GenerateRequest = Parameters<GenerativeModel["generateContent"]>[0];
+type GenerateResult = Awaited<ReturnType<GenerativeModel["generateContent"]>>;
 
 /**
- * Draft model: prefers the on-device model (Gemini Nano in Chrome) and falls
- * back to the cloud model when no local model is available. Used for the fast,
- * private first draft; unpublished ideas never leave the device when Nano runs.
+ * Runs one generation with the given routing mode, walking the cloud model
+ * fallback chain until one model answers. On-device success returns on the
+ * first attempt; the chain only advances when a call actually errors.
  */
-export const draftModel: GenerativeModel = getGenerativeModel(ai, {
-  mode: InferenceMode.PREFER_ON_DEVICE,
-  inCloudParams: { model: CLOUD_MODEL },
-});
-
-/**
- * Polish model: prefers the cloud model for the heavier rewrite pass
- * (final caption + hashtags + CTA as structured JSON).
- */
-export const polishModel: GenerativeModel = getGenerativeModel(ai, {
-  mode: InferenceMode.PREFER_IN_CLOUD,
-  inCloudParams: { model: CLOUD_MODEL },
-});
+async function generateWithFallback(
+  mode: InferenceMode,
+  request: GenerateRequest,
+): Promise<GenerateResult> {
+  let lastError: unknown;
+  for (const cloudModel of CLOUD_MODELS) {
+    try {
+      return await hybridModel(mode, cloudModel).generateContent(request);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(String(lastError ?? "All cloud models failed."));
+}
 
 export type InferenceOrigin = "on-device" | "cloud" | "unknown";
 
@@ -64,7 +97,7 @@ export async function initDeviceModel(
   onProgress?: (fraction: number) => void,
 ): Promise<void> {
   try {
-    await draftModel.initializeDeviceModel((value: number) => {
+    await deviceModel.initializeDeviceModel((value: number) => {
       onProgress?.(value);
     });
     onProgress?.(1);
@@ -153,7 +186,7 @@ export async function draftHooksAndCaptions(
 
   let result;
   try {
-    result = await draftModel.generateContent({
+    result = await generateWithFallback(InferenceMode.PREFER_ON_DEVICE, {
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: {
         responseMimeType: "application/json",
@@ -204,7 +237,7 @@ export async function polishCaption(
 
   let result;
   try {
-    result = await polishModel.generateContent({
+    result = await generateWithFallback(InferenceMode.PREFER_IN_CLOUD, {
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: {
         responseMimeType: "application/json",
