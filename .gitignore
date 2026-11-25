@@ -1,0 +1,14 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# local env (NEVER commit real Firebase config or debug tokens)
+.env
+.env.local
+.env.*.local
+
+# editor / OS
+.DS_Store
+*.local
