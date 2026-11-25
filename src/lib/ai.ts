@@ -126,6 +126,45 @@ function toOrigin(source: InferenceSource | undefined): InferenceOrigin {
   return "unknown";
 }
 
+/**
+ * Repairs JSON that was cut off mid-stream (on-device models have small
+ * output limits, so a long structured answer can end mid-string). Cuts the
+ * text at the last comma outside any string and closes every bracket that
+ * was open at that point, keeping only complete elements.
+ */
+function repairTruncatedJson(text: string): string | null {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  const s = text.slice(start);
+  let inString = false;
+  let escaped = false;
+  const stack: string[] = [];
+  let cutIndex = -1;
+  let cutStack: string[] = [];
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === "\\") escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') inString = true;
+    else if (c === "{" || c === "[") stack.push(c);
+    else if (c === "}" || c === "]") stack.pop();
+    else if (c === "," && stack.length > 0) {
+      cutIndex = i;
+      cutStack = [...stack];
+    }
+  }
+  if (cutIndex < 0) return null;
+  const closers = cutStack
+    .reverse()
+    .map((open) => (open === "{" ? "}" : "]"))
+    .join("");
+  return s.slice(0, cutIndex) + closers;
+}
+
 /** Parses a model JSON response, tolerating markdown fences and prose around the object. */
 function parseJson(text: string): Record<string, unknown> {
   const unfenced = text
@@ -141,6 +180,15 @@ function parseJson(text: string): Record<string, unknown> {
   try {
     return JSON.parse(candidate) as Record<string, unknown>;
   } catch {
+    // Maybe the answer was truncated mid-JSON; try to salvage complete items.
+    const repaired = repairTruncatedJson(unfenced);
+    if (repaired) {
+      try {
+        return JSON.parse(repaired) as Record<string, unknown>;
+      } catch {
+        // fall through to the error below
+      }
+    }
     throw new Error(
       "The model returned a response that was not valid JSON. Please try again.",
     );
