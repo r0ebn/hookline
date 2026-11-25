@@ -126,14 +126,20 @@ function toOrigin(source: InferenceSource | undefined): InferenceOrigin {
   return "unknown";
 }
 
-/** Parses a model JSON response, tolerating accidental markdown fences. */
+/** Parses a model JSON response, tolerating markdown fences and prose around the object. */
 function parseJson(text: string): Record<string, unknown> {
-  const cleaned = text
+  const unfenced = text
     .trim()
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/, "");
+  // On-device models sometimes wrap the JSON in explanatory prose; extract
+  // the outermost object before parsing.
+  const start = unfenced.indexOf("{");
+  const end = unfenced.lastIndexOf("}");
+  const candidate =
+    start >= 0 && end > start ? unfenced.slice(start, end + 1) : unfenced;
   try {
-    return JSON.parse(cleaned) as Record<string, unknown>;
+    return JSON.parse(candidate) as Record<string, unknown>;
   } catch {
     throw new Error(
       "The model returned a response that was not valid JSON. Please try again.",
@@ -184,31 +190,44 @@ export async function draftHooksAndCaptions(
     transcript.trim(),
   ].join("\n");
 
-  let result;
-  try {
-    result = await generateWithFallback(InferenceMode.PREFER_ON_DEVICE, {
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: {
-        responseMimeType: "application/json",
-        responseSchema: draftSchema,
-        temperature: 0.9,
-      },
-    });
-  } catch (error) {
-    throw new Error(
-      `Draft failed: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
+  const request: GenerateRequest = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: draftSchema,
+      temperature: 0.9,
+    },
+  };
 
-  const parsed = parseJson(result.response.text());
-  const hooks = asStringArray(parsed.hooks, "hooks").slice(0, 5);
-  const captions = asStringArray(parsed.captions, "captions").slice(0, 3);
-  if (hooks.length === 0 || captions.length === 0) {
-    throw new Error(
-      "The model returned no hooks or captions. Please try again.",
-    );
+  // Two attempts: device first, then cloud. A generation that returns
+  // unusable text (for example Gemini Nano answering with prose around the
+  // JSON) counts as a failed attempt, so the cloud attempt still runs and
+  // the user is never stuck with a parse error.
+  let lastError: unknown;
+  for (const mode of [
+    InferenceMode.PREFER_ON_DEVICE,
+    InferenceMode.PREFER_IN_CLOUD,
+  ]) {
+    try {
+      const result = await generateWithFallback(mode, request);
+      const parsed = parseJson(result.response.text());
+      const hooks = asStringArray(parsed.hooks, "hooks").slice(0, 5);
+      const captions = asStringArray(parsed.captions, "captions").slice(0, 3);
+      if (hooks.length === 0 || captions.length === 0) {
+        throw new Error("The model returned no hooks or captions.");
+      }
+      return {
+        hooks,
+        captions,
+        origin: toOrigin(result.response.inferenceSource),
+      };
+    } catch (error) {
+      lastError = error;
+    }
   }
-  return { hooks, captions, origin: toOrigin(result.response.inferenceSource) };
+  throw new Error(
+    `Draft failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  );
 }
 
 /**
@@ -235,37 +254,45 @@ export async function polishCaption(
       : []),
   ].join("\n");
 
-  let result;
-  try {
-    result = await generateWithFallback(InferenceMode.PREFER_IN_CLOUD, {
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: {
-        responseMimeType: "application/json",
-        responseSchema: polishSchema,
-        temperature: 0.7,
-      },
-    });
-  } catch (error) {
-    throw new Error(
-      `Polish failed: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-
-  const parsed = parseJson(result.response.text());
-  const finalCaption =
-    typeof parsed.caption === "string" ? parsed.caption.trim() : "";
-  const hashtags = asStringArray(parsed.hashtags, "hashtags")
-    .map((tag) => tag.replace(/^#+/, "").replace(/\s+/g, ""))
-    .filter((tag) => tag.length > 0)
-    .slice(0, 10);
-  const cta = typeof parsed.cta === "string" ? parsed.cta.trim() : "";
-  if (!finalCaption) {
-    throw new Error("The model returned an empty caption. Please try again.");
-  }
-  return {
-    caption: finalCaption,
-    hashtags,
-    cta,
-    origin: toOrigin(result.response.inferenceSource),
+  const request: GenerateRequest = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: polishSchema,
+      temperature: 0.7,
+    },
   };
+
+  // One retry: a single malformed response should not fail the polish.
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const result = await generateWithFallback(
+        InferenceMode.PREFER_IN_CLOUD,
+        request,
+      );
+      const parsed = parseJson(result.response.text());
+      const finalCaption =
+        typeof parsed.caption === "string" ? parsed.caption.trim() : "";
+      const hashtags = asStringArray(parsed.hashtags, "hashtags")
+        .map((tag) => tag.replace(/^#+/, "").replace(/\s+/g, ""))
+        .filter((tag) => tag.length > 0)
+        .slice(0, 10);
+      const cta = typeof parsed.cta === "string" ? parsed.cta.trim() : "";
+      if (!finalCaption) {
+        throw new Error("The model returned an empty caption.");
+      }
+      return {
+        caption: finalCaption,
+        hashtags,
+        cta,
+        origin: toOrigin(result.response.inferenceSource),
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(
+    `Polish failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  );
 }
