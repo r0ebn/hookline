@@ -28,7 +28,9 @@ const ai = getAI(firebaseApp, { backend: new GoogleAIBackend() });
 
 // Cloud model used whenever a hybrid request is served in the cloud
 // (free tier on the Gemini Developer API backend, no billing).
-const CLOUD_MODEL = "gemini-2.5-flash";
+// NOTE: gemini-2.5-flash returns 404 "no longer available to new users" on
+// projects created in Nov 2026; the backend error itself names this model.
+const CLOUD_MODEL = "gemini-3.8-flash";
 
 /**
  * Draft model: prefers the on-device model (Gemini Nano in Chrome) and falls
